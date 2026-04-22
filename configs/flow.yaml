@@ -1,0 +1,30 @@
+experiment_name: flow_matching
+seed: 42
+
+dataset_config: configs/dataset.yaml
+
+training:
+  device: cuda
+  epochs: 60
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  val_every: 1
+  save_every: 5
+  out_dir: outputs/flow
+
+model:
+  image_encoder: small_cnn
+  image_feature_dim: 256
+  proprio_hidden: [128, 128]
+  cond_hidden: [512, 256]
+  flow_hidden: [512, 512]
+  time_embed_dim: 64
+
+flow:
+  sigma: 1.0
+
+logging:
+  backend: tensorboard
+  log_every_steps: 20
