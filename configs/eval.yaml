@@ -1,0 +1,12 @@
+dataset_config: configs/dataset.yaml
+
+evaluation:
+  split: test
+  batch_size: 128
+  device: cuda
+  output_dir: outputs/eval
+  per_dim_metrics: true
+
+checkpoints:
+  bc_checkpoint: outputs/bc/checkpoint_last.pt
+  flow_checkpoint: outputs/flow/checkpoint_last.pt

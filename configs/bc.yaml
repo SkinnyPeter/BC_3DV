@@ -1,0 +1,29 @@
+experiment_name: bc_baseline
+seed: 42
+
+dataset_config: configs/dataset.yaml
+
+training:
+  device: cuda
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  val_every: 1
+  save_every: 5
+  out_dir: outputs/bc
+
+model:
+  image_encoder: small_cnn # [small_cnn, resnet18]
+  image_feature_dim: 256
+  proprio_hidden: [128, 128]
+  fusion_hidden: [512, 256]
+
+loss:
+  mse_weight: 1.0
+  smoothness_weight: 0.1
+
+logging:
+  backend: tensorboard # [tensorboard, none]
+  log_every_steps: 20
