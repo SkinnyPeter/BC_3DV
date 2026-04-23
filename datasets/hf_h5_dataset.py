@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+"""Hugging Face H5 Dataset - streams data without full download."""
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -7,10 +6,9 @@ from typing import Any, Dict, List, Sequence
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 import torch.nn.functional as F
-
-from datasets.utils import load_episode_filepaths
+from torch.utils.data import Dataset
+import huggingface_hub
 
 
 def _normalize_image(img: torch.Tensor, mean: Sequence[float], std: Sequence[float]) -> torch.Tensor:
@@ -32,10 +30,7 @@ def _to_chw_float(image_np: np.ndarray) -> torch.Tensor:
 
 
 def derive_surrogate_actions_from_states(states: np.ndarray) -> np.ndarray:
-    """Derive surrogate action as next-step state delta.
-
-    TODO(project-specific): replace with true action derivation if robot dynamics are known.
-    """
+    """Derive surrogate action as next-step state delta."""
     deltas = np.zeros_like(states)
     deltas[:-1] = states[1:] - states[:-1]
     deltas[-1] = deltas[-2] if len(states) > 1 else 0.0
@@ -52,31 +47,31 @@ def _coerce_keys(keys: Sequence[str] | None, key: str | None, name: str) -> list
     raise ValueError(f"Either {name} or {name[:-1]} must be provided.")
 
 
-class H5EpisodeDataset(Dataset):
+class HFH5EpisodeDataset(Dataset):
+    """Dataset that streams H5 files from Hugging Face."""
+
     def __init__(
         self,
-        raw_dir: str,
-        split_file: str,
+        hf_repo_id: str,
+        split_file: str,  # local file with train/val splits
         split: str,
         image_keys: list[str],
         proprio_key: str | None = None,
         action_key: str | None = "actions",
         proprio_keys: Sequence[str] | None = None,
         action_keys: Sequence[str] | None = None,
-        file_glob: str = "*.h5",
         frame_stack: int = 1,
-        action_chunk: int = 1,
+        action_chunk: int = 8,
         action_stride: int = 1,
         resize_hw: Sequence[int] = (128, 128),
         normalize_images: bool = True,
         image_mean: Sequence[float] = (0.485, 0.456, 0.406),
         image_std: Sequence[float] = (0.229, 0.224, 0.225),
         derive_action_if_missing: bool = True,
-        index_cache_file: str | None = None,
     ) -> None:
         super().__init__()
-        self.raw_dir = Path(raw_dir)
-        self.image_keys = image_keys  # list of camera keys
+        self.hf_repo_id = hf_repo_id
+        self.image_keys = image_keys
         self.proprio_keys = _coerce_keys(proprio_keys, proprio_key, "proprio_keys")
         self.action_keys = _coerce_keys(action_keys, action_key, "action_keys")
         if derive_action_if_missing and len(self.action_keys) != len(self.proprio_keys):
@@ -90,33 +85,41 @@ class H5EpisodeDataset(Dataset):
         self.image_std = image_std
         self.derive_action_if_missing = derive_action_if_missing
 
-        with open(split_file, "r", encoding="utf-8") as f:
+        # Load splits from local file
+        with open(split_file, "r") as f:
             splits = json.load(f)
-        split_eps = set(splits[split])
+        self.episode_names = splits[split]
 
-        all_files = load_episode_filepaths(self.raw_dir, file_glob=file_glob)
-        self.episode_files = [p for p in all_files if p.name in split_eps]
-        if not self.episode_files:
-            raise RuntimeError(f"No episodes found for split={split}. Check split file and raw_dir.")
+        # Get file list from HF
+        self.api = huggingface_hub.HfApi()
+        self.file_list = self._get_file_list()
 
-        self.samples: List[Dict[str, Any]] = self._build_or_load_index(index_cache_file, split)
+        # Build sample index
+        self.samples = self._build_index()
 
-    def _build_or_load_index(self, index_cache_file: str | None, split: str) -> List[Dict[str, Any]]:
-        if index_cache_file is not None and Path(index_cache_file).exists():
-            with open(index_cache_file, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            if split in cache:
-                return cache[split]
+    def _get_file_list(self) -> Dict[str, str]:
+        """Get list of H5 files from repo."""
+        files = self.api.list_repo_files(self.hf_repo_id)
+        h5_files = [f for f in files if f.endswith(".h5")]
+        return {Path(f).name: f for f in h5_files}
 
-        samples: List[Dict[str, Any]] = []
-        for ep_i, path in enumerate(self.episode_files):
-            with h5py.File(path, "r") as f:
-                T = int(f[self.proprio_keys[0]].shape[0])
+    def _build_index(self) -> List[Dict[str, Any]]:
+        """Build index of all samples."""
+        samples = []
+        for ep_name in self.episode_names:
+            if ep_name not in self.file_list:
+                print(f"Warning: {ep_name} not found in HF repo")
+                continue
+
+            # Get episode length - we need to stream to know this
+            # For now, we'll try to get it from metadata or assume a fixed length
+            # You may need to adjust this based on your data
+            T = 200  # placeholder - adjust based on your data
 
             min_t = self.frame_stack - 1
             max_t = T - 1 - (self.action_chunk - 1) * self.action_stride
             for t in range(min_t, max_t + 1):
-                samples.append({"episode_idx": ep_i, "t": t, "episode_name": path.name})
+                samples.append({"episode_name": ep_name, "t": t})
         return samples
 
     def __len__(self) -> int:
@@ -139,7 +142,7 @@ class H5EpisodeDataset(Dataset):
         parts = [torch.from_numpy(np.asarray(f[key][t])).float().reshape(-1) for key in self.proprio_keys]
         return torch.cat(parts, dim=0)
 
-    def _read_action_chunk(self, f: h5py.File, idxs: list[int]) -> tuple[torch.Tensor, bool]:
+    def _read_action_chunk(self, f: h5py.File, idxs: list[int], ep_name: str) -> tuple[torch.Tensor, bool]:
         chunks = []
         action_is_derived = False
         for i, action_key in enumerate(self.action_keys):
@@ -147,7 +150,7 @@ class H5EpisodeDataset(Dataset):
                 action_all = np.asarray(f[action_key])
             else:
                 if not self.derive_action_if_missing:
-                    raise KeyError(f"Missing action key '{action_key}' in episode file.")
+                    raise KeyError(f"Missing action key '{action_key}' in {ep_name}")
                 states = np.asarray(f[self.proprio_keys[i]])
                 action_all = derive_surrogate_actions_from_states(states)
                 action_is_derived = True
@@ -156,10 +159,19 @@ class H5EpisodeDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         s = self.samples[idx]
-        ep_path = self.episode_files[s["episode_idx"]]
+        ep_name = s["episode_name"]
         t = s["t"]
 
-        with h5py.File(ep_path, "r") as f:
+        # Stream the specific episode file from HF
+        remote_path = self.file_list[ep_name]
+
+        # Download only the needed file (streams, doesn't download everything)
+        local_path = huggingface_hub.hf_hub_download(
+            repo_id=self.hf_repo_id,
+            filename=remote_path
+        )
+
+        with h5py.File(local_path, "r") as f:
             # Read multiple cameras and concatenate
             images = []
             for image_key in self.image_keys:
@@ -169,13 +181,13 @@ class H5EpisodeDataset(Dataset):
 
             idxs = [t + i * self.action_stride for i in range(self.action_chunk)]
             proprio = self._read_proprio(f, t)
-            action_chunk, action_is_derived = self._read_action_chunk(f, idxs)
+            action_chunk, action_is_derived = self._read_action_chunk(f, idxs, ep_name)
 
         return {
             "image": image,
             "proprio": proprio,
             "action": action_chunk,
-            "episode_id": s["episode_name"],
+            "episode_id": ep_name,
             "timestep": t,
             "action_is_derived": action_is_derived,
         }

@@ -12,9 +12,15 @@ h5:
   treat_each_file_as_episode: true
 
 keys:
-  image_key: "observations/images/front"
-  proprio_key: "observations/qpos"
-  action_key: "actions"
+  image_keys:
+    - "observations/images/aria_rgb_cam/color"
+    - "observations/images/oakd_front_view/color"
+  proprio_keys:
+    - "observations/qpos_arm_left"
+    - "observations/qpos_arm_right"
+  action_keys:
+    - "actions_arm_left"
+    - "actions_arm_right"
 
 fallback:
   derive_action_if_missing: true
