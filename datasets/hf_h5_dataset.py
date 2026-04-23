@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-import huggingface_hub
+from huggingface_hub import HfFileSystem
 
 
 def _normalize_image(img: torch.Tensor, mean: Sequence[float], std: Sequence[float]) -> torch.Tensor:
@@ -30,7 +30,6 @@ def _to_chw_float(image_np: np.ndarray) -> torch.Tensor:
 
 
 def derive_surrogate_actions_from_states(states: np.ndarray) -> np.ndarray:
-    """Derive surrogate action as next-step state delta."""
     deltas = np.zeros_like(states)
     deltas[:-1] = states[1:] - states[:-1]
     deltas[-1] = deltas[-2] if len(states) > 1 else 0.0
@@ -47,13 +46,17 @@ def _coerce_keys(keys: Sequence[str] | None, key: str | None, name: str) -> list
     raise ValueError(f"Either {name} or {name[:-1]} must be provided.")
 
 
+def _hf_path(repo_id: str, filename: str) -> str:
+    return f"datasets/{repo_id}/{filename}"
+
+
 class HFH5EpisodeDataset(Dataset):
-    """Dataset that streams H5 files from Hugging Face."""
+    """Dataset that streams H5 files from Hugging Face without downloading."""
 
     def __init__(
         self,
         hf_repo_id: str,
-        split_file: str,  # local file with train/val splits
+        split_file: str,
         split: str,
         image_keys: list[str],
         proprio_key: str | None = None,
@@ -85,37 +88,31 @@ class HFH5EpisodeDataset(Dataset):
         self.image_std = image_std
         self.derive_action_if_missing = derive_action_if_missing
 
-        # Load splits from local file
+        self.fs = HfFileSystem()
+
         with open(split_file, "r") as f:
             splits = json.load(f)
         self.episode_names = splits[split]
 
-        # Get file list from HF
-        self.api = huggingface_hub.HfApi()
         self.file_list = self._get_file_list()
-
-        # Build sample index
         self.samples = self._build_index()
 
     def _get_file_list(self) -> Dict[str, str]:
-        """Get list of H5 files from repo."""
-        files = self.api.list_repo_files(self.hf_repo_id)
-        h5_files = [f for f in files if f.endswith(".h5")]
-        return {Path(f).name: f for f in h5_files}
+        files = self.fs.glob(f"datasets/{self.hf_repo_id}/**/*.h5")
+        return {Path(f).name: f for f in files}
+
+    def _open_episode(self, ep_name: str) -> h5py.File:
+        remote = self.file_list[ep_name]
+        return h5py.File(self.fs.open(remote, "rb"), "r")
 
     def _build_index(self) -> List[Dict[str, Any]]:
-        """Build index of all samples."""
         samples = []
         for ep_name in self.episode_names:
             if ep_name not in self.file_list:
                 print(f"Warning: {ep_name} not found in HF repo")
                 continue
-
-            # Get episode length - we need to stream to know this
-            # For now, we'll try to get it from metadata or assume a fixed length
-            # You may need to adjust this based on your data
-            T = 200  # placeholder - adjust based on your data
-
+            with self._open_episode(ep_name) as f:
+                T = f[self.action_keys[0]].shape[0]
             min_t = self.frame_stack - 1
             max_t = T - 1 - (self.action_chunk - 1) * self.action_stride
             for t in range(min_t, max_t + 1):
@@ -126,7 +123,6 @@ class HFH5EpisodeDataset(Dataset):
         return len(self.samples)
 
     def _read_frame_stack(self, f: h5py.File, t: int, image_key: str) -> torch.Tensor:
-        """Read frame stack for a single camera."""
         frames = []
         for i in range(self.frame_stack):
             ti = t - (self.frame_stack - 1 - i)
@@ -162,22 +158,12 @@ class HFH5EpisodeDataset(Dataset):
         ep_name = s["episode_name"]
         t = s["t"]
 
-        # Stream the specific episode file from HF
-        remote_path = self.file_list[ep_name]
-
-        # Download only the needed file (streams, doesn't download everything)
-        local_path = huggingface_hub.hf_hub_download(
-            repo_id=self.hf_repo_id,
-            filename=remote_path
-        )
-
-        with h5py.File(local_path, "r") as f:
-            # Read multiple cameras and concatenate
+        with self._open_episode(ep_name) as f:
             images = []
             for image_key in self.image_keys:
                 img = self._read_frame_stack(f, t, image_key)
                 images.append(img)
-            image = torch.cat(images, dim=0)  # (num_cameras * C, H, W)
+            image = torch.cat(images, dim=0)
 
             idxs = [t + i * self.action_stride for i in range(self.action_chunk)]
             proprio = self._read_proprio(f, t)

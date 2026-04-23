@@ -1,0 +1,7 @@
+cd /home/teamb/Desktop/BC_3DV
+python -m training.train_bc --config configs/bc.yaml
+
+
+conda activate sim2real
+
+df -h ~
